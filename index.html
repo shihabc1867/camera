@@ -52,6 +52,12 @@ select{background:#262633;color:#fff;border:1px solid #333;border-radius:8px;pad
 #modal button,#modal a{background:#2563eb;color:#fff;border:0;border-radius:10px;padding:12px 18px;font-size:15px;text-decoration:none}
 #modal button.g{background:#333}
 #info{text-align:center;font-size:12px;color:#aaa;padding:6px}
+#idle{position:absolute;inset:0;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;z-index:5;text-align:center;padding:20px}
+#idle .big{font-size:64px}
+#openBtn{background:#2563eb;color:#fff;border:0;border-radius:28px;padding:16px 34px;font-size:18px;font-weight:600}
+#openBtn:active{transform:scale(.96)}
+#idle p{margin:0;font-size:13px;color:#888;max-width:260px}
+#shutter:disabled,#flipBtn:disabled{opacity:.35}
 </style>
 </head>
 <body>
@@ -65,6 +71,12 @@ select{background:#262633;color:#fff;border:1px solid #333;border-radius:8px;pad
       <button id="installBtn">Install</button>
       <button class="ib" id="gridBtn" title="Grid">▦</button>
       <button class="ib" id="flipBtn" title="Switch camera">🔄</button>
+      <button class="ib" id="closeBtn" title="Close camera">✕</button>
+    </div>
+    <div id="idle">
+      <div class="big">📷</div>
+      <button id="openBtn">Open Camera</button>
+      <p>The camera stays off until you tap this button.</p>
     </div>
   </div>
 
@@ -89,8 +101,9 @@ select{background:#262633;color:#fff;border:1px solid #333;border-radius:8px;pad
     <div class="tab" id="t3">
       <div class="row"><label>Resolution</label>
         <select id="res">
-          <option value="7680" selected>8K (7680px)</option>
+          <option value="1920" selected>HD (1920px) – fast</option>
           <option value="3840">4K (3840px)</option>
+          <option value="7680">8K (7680px) – slow</option>
           <option value="0">Original (no upscale)</option>
         </select></div>
       <div class="row"><label>Quality</label>
@@ -154,21 +167,42 @@ function msg(t, ms){
 }
 
 // ---- Camera ----
+// The camera only runs while it is explicitly opened, and is stopped whenever the app is hidden/closed.
+function setCameraUI(on){
+  $('idle').style.display = on ? 'none' : 'flex';
+  $('shutter').disabled = !on;
+  $('flipBtn').disabled = !on;
+  $('closeBtn').style.display = on ? 'block' : 'none';
+}
+function stopCamera(){
+  if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
+  video.pause();
+  video.srcObject = null;
+  setCameraUI(false);
+  $('info').textContent = '';
+  $('count').style.display = 'none';
+}
 async function startCamera(){
   try{
-    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
+    // HD preview is lighter and faster; 4K/8K/original need the bigger stream
+    const hd = $('res').value === '1920';
+    const vc = hd ? {width:{ideal:1920}, height:{ideal:1080}} : {width:{ideal:4096}, height:{ideal:2160}};
     stream = await navigator.mediaDevices.getUserMedia({
-      video: {facingMode:{ideal:facing}, width:{ideal:4096}, height:{ideal:2160}},
+      video: {facingMode:{ideal:facing}, ...vc},
       audio: false
     });
+    if (document.hidden){ stopCamera(); return; } // app was hidden while permission/startup was pending
     video.srcObject = stream;
     video.style.transform = facing === 'user' ? 'scaleX(-1)' : 'none';
-    await video.play().catch(()=>{});
     video.onloadedmetadata = showInfo;
+    await video.play().catch(()=>{});
+    setCameraUI(true);
     showInfo();
     msg('');
   }catch(e){
-    msg('Could not start the camera. Allow camera permission (HTTPS is required).');
+    stopCamera();
+    msg('Could not start the camera. Allow camera permission (HTTPS is required).', 5000);
     console.error(e);
   }
 }
@@ -211,7 +245,14 @@ $('reset').onclick = () => {
   chips.querySelectorAll('.chip').forEach((x,i) => x.classList.toggle('on', i === 0));
 };
 $('gridBtn').onclick = () => { const g = $('grid'); g.style.display = g.style.display === 'block' ? 'none' : 'block'; };
-$('flipBtn').onclick = () => { facing = facing === 'user' ? 'environment' : 'user'; startCamera(); };
+$('flipBtn').onclick = () => { facing = facing === 'user' ? 'environment' : 'user'; if (stream) startCamera(); };
+$('openBtn').onclick = () => startCamera();
+$('closeBtn').onclick = () => stopCamera();
+$('res').onchange = () => { if (stream) startCamera(); };
+
+// Turn the camera off as soon as the app is minimized, switched away from, or closed
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopCamera(); });
+window.addEventListener('pagehide', stopCamera);
 
 // ---- Capture ----
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
@@ -227,10 +268,10 @@ $('shutter').onclick = async () => {
   capture();
 };
 
-async function getSource(){
-  // Try full-resolution still (ImageCapture), otherwise fall back to a video frame
+async function getSource(wantStill){
+  // HD: use the live frame directly (instant). 4K/8K/original: try full-resolution still (ImageCapture), else video frame
   try{
-    if ('ImageCapture' in window && stream){
+    if (wantStill && 'ImageCapture' in window && stream){
       const ic = new ImageCapture(stream.getVideoTracks()[0]);
       const blob = await ic.takePhoto();
       const bmp = await createImageBitmap(blob);
@@ -244,22 +285,22 @@ async function capture(){
   if (!video.videoWidth){ msg('Camera is not ready yet', 2000); return; }
   busy = true; $('shutter').disabled = true;
   try{
-    msg('Capturing…');
-    const {src, w, h} = await getSource();
     const long = +$('res').value;
+    msg('Capturing…');
+    const {src, w, h} = await getSource(long !== 1920);
     const mime = $('fmt').value, q = +$('qual').value;
     const mirror = facing === 'user';
     const sizes = [];
     const calc = L => (w >= h) ? [L, Math.round(L * h / w)] : [Math.round(L * w / h), L];
     if (long === 0) sizes.push([w, h]);
+    else if (long === 1920) sizes.push(calc(Math.min(1920, Math.max(w, h)))); // HD: never upscale, no sharpen pass
     else { sizes.push(calc(long)); if (long > 3840) sizes.push(calc(3840)); sizes.push(calc(2560)); }
 
     let blob = null, used = null;
     const cv = $('cv');
     for (const [W, H] of sizes){
       try{
-        msg(`Processing… ${W}×${H}`);
-        await sleep(30);
+        if (long !== 1920){ msg(`Processing… ${W}×${H}`); await sleep(30); }
         cv.width = W; cv.height = H;
         const ctx = cv.getContext('2d');
         if (!ctx) continue;
@@ -287,7 +328,7 @@ async function capture(){
   }catch(e){
     console.error(e); msg('Something went wrong: ' + e.message, 4000);
   }finally{
-    busy = false; $('shutter').disabled = false;
+    busy = false; $('shutter').disabled = !stream;
   }
 }
 
@@ -350,7 +391,7 @@ if ('serviceWorker' in navigator){
 
 syncSliders();
 applyLive();
-startCamera();
+setCameraUI(false); // camera stays off until "Open Camera" is tapped
 </script>
 </body>
 </html>
